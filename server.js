@@ -1,13 +1,13 @@
 const express = require("express");
 const path = require("path");
-const Anthropic = require("@anthropic-ai/sdk");
 
 const app = express();
 app.use(express.json({ limit: "20kb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
-const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-const MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-5-5";
+const API_KEY = process.env.GEMINI_API_KEY;
+const MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const URL = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL}:generateContent`;
 
 const SYSTEM_PROMPT = `You are Amsa, a friendly assistant that speaks English and Hausa.
 - Reply in the language the user writes in (English or Hausa). If they mix, mirror them.
@@ -39,27 +39,42 @@ app.post("/api/chat", async (req, res) => {
   if (limited(req.ip)) {
     return res.status(429).json({ error: "Too many messages. Please wait a moment." });
   }
+  if (!API_KEY) {
+    return res.status(500).json({ error: "Server is missing GEMINI_API_KEY." });
+  }
 
   const history = sessions.get(sessionId) || [];
-  history.push({ role: "user", content: message.trim().slice(0, 2000) });
+  history.push({ role: "user", parts: [{ text: message.trim().slice(0, 2000) }] });
   const trimmed = history.slice(-MAX_TURNS * 2);
 
   try {
-    const response = await client.messages.create({
-      model: MODEL,
-      max_tokens: 600,
-      system: SYSTEM_PROMPT,
-      messages: trimmed,
+    const r = await fetch(URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-goog-api-key": API_KEY },
+      body: JSON.stringify({
+        systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+        contents: trimmed,
+        generationConfig: { maxOutputTokens: 800 },
+      }),
     });
-    const reply = response.content
-      .filter((b) => b.type === "text")
-      .map((b) => b.text)
-      .join("\n");
-    trimmed.push({ role: "assistant", content: reply });
+    const data = await r.json();
+    if (!r.ok) {
+      console.error("Gemini error:", r.status, JSON.stringify(data));
+      const msg = r.status === 429
+        ? "Amsa is busy right now. Please try again in a minute."
+        : "Amsa could not answer right now. Please try again.";
+      return res.status(500).json({ error: msg });
+    }
+    const reply = (data.candidates?.[0]?.content?.parts || [])
+      .map((p) => p.text || "")
+      .join("\n")
+      .trim();
+    if (!reply) return res.status(500).json({ error: "No answer came back. Please rephrase and try again." });
+    trimmed.push({ role: "model", parts: [{ text: reply }] });
     sessions.set(sessionId, trimmed);
     res.json({ reply });
   } catch (err) {
-    console.error("Claude API error:", err.message);
+    console.error("Request error:", err.message);
     res.status(500).json({ error: "Amsa could not answer right now. Please try again." });
   }
 });
